@@ -1,0 +1,8 @@
+# Tested on macOS arm64 / Apple Silicon with Python 3.13.15.
+# No PyTorch, CUDA, or NVIDIA runtime is required by this local MLX route.
+mlx-audio[stt]==0.5.0
+mlx==0.32.2
+numpy==2.5.2
+soundfile==0.14.0
+opencc-python-reimplemented==0.1.7
+huggingface-hub[hf_xet]==1.28.0
