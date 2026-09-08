@@ -9,7 +9,7 @@
 
 ## 0. 不想自己架環境？直接下載打包好的 App
 
-到 [Releases](https://github.com/Vincent8216/taiwan-subtitle-gui/releases) 下載最新的 `TaiwanSubtitle-x.y.z.dmg`，打開後把 `TaiwanSubtitle.app` 拖進「應用程式」即可，不需要另外裝 Python／pip 套件（FFmpeg 仍需自行 `brew install ffmpeg`，AI 模型會在第一次執行時透過 App 內建的「下載 / 更新模型」取得）。
+到 [Releases](https://github.com/Vincent8216/taiwan-subtitle-gui/releases) 下載最新的 `TaiwanSubtitle-x.y.z.dmg`（約 20 MB），打開後把 `TaiwanSubtitle.app` 拖進「應用程式」即可，不需要自己架 Python 環境。App 本體很精簡，開啟後照畫面上「系統套件」「AI 語音模型」兩個區塊，依序按「安裝缺少的 Python 套件」與「下載 / 更新模型」，即可在本機補齊執行所需的一切（FFmpeg 仍需自行 `brew install ffmpeg`，這是系統工具，不透過 App 安裝）。
 
 這個 build **沒有 Apple Developer 簽章／公證**，第一次打開會被 Gatekeeper 擋下：
 
@@ -160,7 +160,7 @@ python -m pip check
 
 ## 打包成 .app / .dmg
 
-用 PyInstaller 把 `gui.py` 連同所有套件打包成一個獨立的 `TaiwanSubtitle.app`（使用者不需要另外裝 Python）：
+用 PyInstaller 把 `gui.py` 打包成一個獨立的 `TaiwanSubtitle.app`（使用者不需要另外裝 Python）：
 
 ```bash
 source .venv/bin/activate
@@ -171,13 +171,17 @@ python -m pip install -r requirements.txt pyinstaller
 會產生：
 
 - `dist/TaiwanSubtitle.app`
-- `dist/TaiwanSubtitle-<版本>.dmg`
+- `dist/TaiwanSubtitle-<版本>.dmg`（約 20 MB）
 
-版本號在 `packaging/TaiwanSubtitle.spec` 的 `APP_VERSION` 設定。`mlx`／`mlx-audio` 帶有 PyInstaller 預設分析抓不到的 Metal shader（`.metallib`）與其他二進位資產，spec 檔已用 `collect_all()` 特別處理；若之後升級這兩個套件版本，直接用同一份 spec 重新打包即可，不需要額外調整。
+版本號在 `packaging/TaiwanSubtitle.spec` 的 `APP_VERSION` 設定。
 
-打包出來的 App 不含 AI 模型（開啟後用內建的「下載 / 更新模型」取得），模型與設定檔預設存放在 `~/Library/Application Support/TaiwanSubtitle/`（不是 App 本體內部，重新安裝/更新 App 不會清掉已下載的模型）。FFmpeg 仍依賴系統安裝的版本，不會被打包進 App。
+**這是一個精簡外殼，不含 mlx / mlx-audio / numpy / soundfile / opencc / huggingface-hub。** 這幾個套件加起來有幾百 MB（其中 `mlx` 的 Metal shader 檔就 130 MB），跟 AI 模型一樣，改成使用者開啟 App 後自己在「系統套件」面板按「安裝缺少的 Python 套件」才下載安裝——這樣 App 本體維持在 20 MB 左右，而不是把整個 ML 執行環境都塞進安裝檔。
 
-這個 build 沒有 Apple Developer 簽章／公證，發佈前請先在自己機器上完整跑過一次「系統套件檢查 → 下載模型 → 選擇檔案轉錄」確認沒問題。
+實作方式：spec 檔用 `--exclude-module` 明確排除這幾個套件，並用 `collect_all('pip')` 把 pip 本身打包進去。按下「安裝缺少的 Python 套件」時，`transcribe.py` 呼叫 pip 的內部 API（因為打包後 `sys.executable` 是這個 App 自己，不是可執行 `-m pip` 的直譯器），把套件裝進 `~/Library/Application Support/TaiwanSubtitle/pylibs/`，執行期用 `sys.path` 接上去讀——同一個 arm64 + Python 3.13 的 ABI，裝在哪個資料夾都能被正常 import，包括 mlx 的 Metal shader 也能正確定位。AI 模型與設定檔也存在同一個 `Application Support/TaiwanSubtitle/` 資料夾（不是 App 本體內部），所以重新安裝/更新 App 不會清掉已下載的東西。FFmpeg 仍依賴系統安裝的版本，不會被打包進 App，也不會透過 pip 安裝。
+
+若之後升級 `mlx`／`mlx-audio` 版本，直接用同一份 spec 重新打包即可；使用者端下次按「安裝缺少的 Python 套件」（或「重新檢查」偵測到版本不同）就會抓到新版。
+
+這個 build 沒有 Apple Developer 簽章／公證，發佈前請先在自己機器上完整跑過一次「系統套件檢查 → 安裝套件 → 下載模型 → 選擇檔案轉錄」確認沒問題。
 
 ## 模型與套件來源
 

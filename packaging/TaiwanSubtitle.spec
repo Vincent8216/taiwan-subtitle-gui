@@ -4,11 +4,15 @@
 Build with:
     .venv/bin/pyinstaller packaging/TaiwanSubtitle.spec --noconfirm
 
-mlx / mlx-audio ship native Metal shader (.metallib) and binary assets that
-PyInstaller's default import analysis does not pick up on its own, so both
-packages are pulled in wholesale via collect_all() — without this, the built
-app imports fine but MLX fails at the first GPU op ("failed to load default
-metallib").
+Design: this is a THIN launcher. mlx / mlx-audio / numpy / soundfile /
+opencc / huggingface-hub are deliberately EXCLUDED from the bundle — they're
+large (mlx alone ships a ~130MB Metal shader library) and, like the AI
+models, the app downloads them itself on first run via the "系統套件" panel
+("安裝缺少的 Python 套件"), installing into
+~/Library/Application Support/TaiwanSubtitle/pylibs and adding that to
+sys.path at startup (see transcribe.py). That install path uses pip's
+in-process API, so `pip` itself must be bundled — collect_all('pip') pulls
+in its vendored dependencies too.
 """
 
 import os
@@ -20,14 +24,27 @@ BUNDLE_ID = "com.vincent8216.taiwansubtitle"
 
 project_root = os.path.abspath(os.path.join(SPECPATH, ".."))
 
-datas = []
+datas = [(os.path.join(project_root, "requirements.txt"), ".")]
 binaries = []
 hiddenimports = []
-for package in ("mlx", "mlx_audio"):
+for package in ("pip",):
     pkg_datas, pkg_binaries, pkg_hiddenimports = collect_all(package)
     datas += pkg_datas
     binaries += pkg_binaries
     hiddenimports += pkg_hiddenimports
+
+# 這些是 transcribe.py 內部延遲載入（函式內 import）的重型套件；PyInstaller
+# 的靜態分析仍看得到那些 import 陳述式，預設會硬把它們一起打包進來。明確
+# excludes 掉，讓 App 保持精簡——第一次執行時才由使用者自己下載安裝。
+heavy_excludes = [
+    "mlx",
+    "mlx_audio",
+    "mlx_metal",
+    "numpy",
+    "soundfile",
+    "opencc",
+    "huggingface_hub",
+]
 
 a = Analysis(
     [os.path.join(project_root, "gui.py")],
@@ -38,7 +55,7 @@ a = Analysis(
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
-    excludes=[],
+    excludes=heavy_excludes,
     noarchive=False,
     optimize=0,
 )

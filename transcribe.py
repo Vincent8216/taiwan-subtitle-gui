@@ -42,6 +42,17 @@ if getattr(sys, "frozen", False):
 else:
     APP_DATA_DIR = PROJECT_DIR
 
+# 打包版的 App 本身不含 mlx / mlx-audio / numpy / soundfile / opencc /
+# huggingface-hub 這些重型套件（幾百 MB 的 Metal shader、模型程式碼）——
+# 這些跟 AI 模型一樣，改成使用者自己在「系統套件」面板按「安裝缺少的
+# Python 套件」時才下載，裝到這個資料夾，執行期用 sys.path 接上去用。
+# 一般以原始碼執行時完全不受影響（沿用目前 venv 已安裝的套件）。
+PYLIBS_DIR = APP_DATA_DIR / "pylibs"
+if getattr(sys, "frozen", False):
+    PYLIBS_DIR.mkdir(parents=True, exist_ok=True)
+    if str(PYLIBS_DIR) not in sys.path:
+        sys.path.insert(0, str(PYLIBS_DIR))
+
 DEFAULT_HF_HOME = APP_DATA_DIR / "models" / "huggingface"
 TEA_ASR_MLX_MODEL = "Alkd/TEA-ASR-1.1-MLX-4bit"
 TEA_ASR_MLX_COMPATIBILITY_NOTE = (
@@ -661,38 +672,132 @@ def dependencies_ready() -> bool:
     return all(status.installed for status in check_dependencies())
 
 
+def _resolve_install_targets(packages: Sequence[str] | None) -> list[str]:
+    statuses = [s for s in check_dependencies() if s.kind == "python"]
+    if packages is None:
+        return [s.pip_requirement or s.key for s in statuses if not s.installed]
+    wanted = set(packages)
+    return [s.pip_requirement or s.key for s in statuses if s.key in wanted]
+
+
+class _LineTee:
+    """A writable that splits pip's printed output into report() calls.
+
+    pip's default progress bar overwrites itself with bare "\r" (no "\n"),
+    so it's treated as a line break too — otherwise it never shows up until
+    the whole install is done, sitting unseen in the buffer the entire time.
+    """
+
+    def __init__(self, report: Any) -> None:
+        self._report = report
+        self._buffer = ""
+
+    def write(self, chunk: str) -> int:
+        self._buffer += chunk.replace("\r", "\n")
+        while "\n" in self._buffer:
+            line, self._buffer = self._buffer.split("\n", 1)
+            line = line.rstrip()
+            if line:
+                self._report(line, None)
+        return len(chunk)
+
+    def flush(self) -> None:
+        pass
+
+    def isatty(self) -> bool:
+        return False
+
+
+def _install_python_packages_frozen(targets: list[str], report: Any) -> None:
+    """打包版 App 沒有可執行的 sys.executable -m pip；改成呼叫 pip 內部 API，
+    把套件裝進 PYLIBS_DIR，執行期再透過 sys.path 讀到（見檔頭的 bootstrap）。
+    """
+
+    import contextlib
+    import threading
+    import time as _time
+
+    try:
+        from pip._internal.cli.main import main as pip_main
+    except ImportError as exc:
+        raise RuntimeError(
+            "這個 App build 沒有內建 pip，無法自動安裝套件。請回報這個問題，"
+            "或改用原始碼＋requirements.txt 執行。"
+        ) from exc
+
+    PYLIBS_DIR.mkdir(parents=True, exist_ok=True)
+    args = [
+        "install",
+        "--upgrade",
+        "--target",
+        str(PYLIBS_DIR),
+        "--no-warn-script-location",
+        "--progress-bar",
+        "off",
+        *targets,
+    ]
+    tee = _LineTee(report)
+
+    # pip 內部用 logging/Rich 輸出，被 in-process 呼叫時不一定能可靠攔截到
+    # 逐行進度（依 pip 版本而異）；用心跳執行緒保證 GUI 進度條在等待期間
+    # 持續有動靜，而不是像卡住一樣停在 0%。
+    stop_heartbeat = threading.Event()
+
+    def _heartbeat() -> None:
+        started = _time.monotonic()
+        while not stop_heartbeat.wait(1.5):
+            report(f"安裝中…（已進行 {int(_time.monotonic() - started)} 秒）", None)
+
+    heartbeat_thread = threading.Thread(target=_heartbeat, daemon=True)
+    heartbeat_thread.start()
+    try:
+        with contextlib.redirect_stdout(tee), contextlib.redirect_stderr(tee):
+            try:
+                exit_code = pip_main(args)
+            except SystemExit as exc:
+                # pip 的內部 argparse 出錯（例如未來版本不接受某個參數）時，
+                # 會直接 sys.exit() 而不是回傳值；轉成一般例外，才不會把整個
+                # 呼叫端（GUI 背景執行緒／CLI）也跟著吞掉、卻沒有任何訊息。
+                exit_code = exc.code if isinstance(exc.code, int) else 1
+    finally:
+        stop_heartbeat.set()
+        heartbeat_thread.join(timeout=2.0)
+    if tee._buffer:
+        report(tee._buffer, None)
+    if exit_code != 0:
+        raise RuntimeError(f"pip install 失敗（exit code {exit_code}）：{', '.join(targets)}")
+
+    # 剛裝好的套件要能在這次執行期就被 find_spec/import 找到。
+    importlib.invalidate_caches()
+
+
 def install_python_packages(
     packages: Sequence[str] | None = None,
     progress: Any = None,
 ) -> None:
-    """pip-install the given (or all currently-missing) required packages.
+    """安裝目前缺少（或指定）的必要 Python 套件。
 
-    Runs `sys.executable -m pip install ...` so it always targets whichever
-    interpreter is actually running this GUI/CLI, not some other Python.
+    一般以原始碼執行：跑 `sys.executable -m pip install ...`，裝進當前
+    venv，行為和過去一樣。打包成 App 時：sys.executable 是凍結後的執行檔本
+    身，不是可用的直譯器，改成呼叫 pip 內部 API 把套件裝進
+    ~/Library/Application Support/TaiwanSubtitle/pylibs，執行期用 sys.path
+    接上去（跟 AI 模型一樣，App 本體不包含這些套件，第一次使用才下載）。
     """
 
-    if getattr(sys, "frozen", False):
-        raise RuntimeError(
-            "這是打包好的 App，所有必要套件已內建，沒有可用的 pip。"
-            "若真的缺套件，代表這個 App build 有問題，請回報或改用原始碼＋"
-            "requirements.txt 執行。"
-        )
-
     report = _progress_reporter(progress)
-    statuses = [s for s in check_dependencies() if s.kind == "python"]
-    if packages is None:
-        targets = [s.pip_requirement or s.key for s in statuses if not s.installed]
-    else:
-        wanted = set(packages)
-        targets = [
-            s.pip_requirement or s.key for s in statuses if s.key in wanted
-        ]
+    targets = _resolve_install_targets(packages)
 
     if not targets:
         report("所有 Python 套件皆已安裝，略過安裝。", 1.0)
         return
 
     report(f"開始安裝：{', '.join(targets)}", 0.0)
+
+    if getattr(sys, "frozen", False):
+        _install_python_packages_frozen(targets, report)
+        report("Python 套件安裝完成。", 1.0)
+        return
+
     command = [sys.executable, "-m", "pip", "install", "--upgrade", *targets]
     process = subprocess.Popen(
         command,
@@ -2195,4 +2300,12 @@ def transcribe_file(
 
 
 if __name__ == "__main__":
+    import multiprocessing
+
+    # 若這支檔案本身也被凍結打包成獨立 CLI 執行檔，sys.executable 就是它
+    # 自己而不是通用的 python 直譯器；freeze_support() 是官方建議的標準
+    # 防護，避免 multiprocessing 內部（如 resource_tracker）想 spawn 輔助
+    # 行程時失敗。以原始碼執行時這行完全沒有作用。
+    multiprocessing.freeze_support()
+
     raise SystemExit(main())
