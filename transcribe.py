@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import gc
+import importlib.util
 import inspect
 import json
 import math
@@ -25,6 +26,7 @@ import time
 import unicodedata
 from dataclasses import asdict, dataclass, field
 from functools import lru_cache
+from importlib import metadata as importlib_metadata
 from pathlib import Path
 from typing import Any, Iterable, Sequence
 
@@ -173,14 +175,553 @@ def _require_soundfile() -> Any:
     return sf
 
 
-def configure_huggingface_cache() -> Path:
-    """Keep model downloads inside this project unless the caller overrides it."""
+CONFIG_PATH = PROJECT_DIR / "config.json"
 
-    cache_home = Path(os.environ.setdefault("HF_HOME", str(DEFAULT_HF_HOME))).expanduser()
+
+def load_config() -> dict[str, Any]:
+    try:
+        return json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def save_config(data: dict[str, Any]) -> None:
+    CONFIG_PATH.write_text(
+        json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+
+
+def get_model_dir() -> Path:
+    """Resolve where models live: env var > 使用者上次選定 > 專案內建預設值。"""
+
+    env_value = os.environ.get("HF_HOME")
+    if env_value:
+        return Path(env_value).expanduser().resolve()
+    configured = load_config().get("model_dir")
+    if configured:
+        return Path(configured).expanduser().resolve()
+    return DEFAULT_HF_HOME
+
+
+def set_model_dir(
+    path: str | Path, move_existing: bool = False, progress: Any = None
+) -> Path:
+    """把模型存放目錄換成 path，寫進 config.json 讓下次啟動也記得。
+
+    move_existing=True 時會把舊目錄底下的 hub 快取整包搬過去，
+    這樣換目錄不用重新下載一次已經有的模型。
+    """
+
+    report = _progress_reporter(progress)
+    new_dir = Path(path).expanduser().resolve()
+    old_dir = get_model_dir()
+    new_dir.mkdir(parents=True, exist_ok=True)
+
+    if move_existing and old_dir != new_dir:
+        old_hub = old_dir / "hub"
+        new_hub = new_dir / "hub"
+        if old_hub.is_dir() and any(old_hub.iterdir()):
+            if new_hub.exists() and any(new_hub.iterdir()):
+                raise RuntimeError(
+                    f"目標資料夾已有模型快取（{new_hub}），"
+                    "請改選空資料夾，或關閉「搬移現有模型」再試一次。"
+                )
+            report(f"搬移模型快取：{old_hub} -> {new_hub}", None)
+            shutil.move(str(old_hub), str(new_hub))
+            report("搬移完成。", 1.0)
+
+    config = load_config()
+    config["model_dir"] = str(new_dir)
+    save_config(config)
+
+    os.environ["HF_HOME"] = str(new_dir)
+    os.environ["HF_HUB_CACHE"] = str(new_dir / "hub")
+    Path(os.environ["HF_HUB_CACHE"]).mkdir(parents=True, exist_ok=True)
+    return new_dir
+
+
+def configure_huggingface_cache() -> Path:
+    """Keep model downloads inside the configured 模型存放目錄。"""
+
+    cache_home = get_model_dir()
+    os.environ["HF_HOME"] = str(cache_home)
     os.environ.setdefault("HF_HUB_CACHE", str(cache_home / "hub"))
     cache_home.mkdir(parents=True, exist_ok=True)
     Path(os.environ["HF_HUB_CACHE"]).mkdir(parents=True, exist_ok=True)
     return cache_home
+
+
+# --- 模型下載 / 檢查：與轉錄流程完全分離的獨立 API ---------------------------
+#
+# GUI（或 CLI 的 --check-models / --download-models）先用這組函式把模型備妥，
+# run_transcription() 預設不再連網下載，避免使用者按下轉錄後才卡在下載。
+
+REQUIRED_MODELS: tuple[str, ...] = (TEA_ASR_MLX_MODEL, DEFAULT_ALIGNER_MODEL)
+MODEL_LABELS: dict[str, str] = {
+    TEA_ASR_MLX_MODEL: "語音辨識模型 (TEA-ASR)",
+    DEFAULT_ALIGNER_MODEL: "時間軸對齊模型 (Qwen3 ForcedAligner)",
+}
+_WEIGHT_SUFFIXES = (".safetensors", ".npz", ".bin", ".gguf")
+
+
+@dataclass
+class ModelStatus:
+    """One model's local-cache state, as shown on the GUI 模型面板."""
+
+    model_id: str
+    label: str
+    ready: bool
+    detail: str
+    path: Path | None = None
+    size_bytes: int = 0
+
+
+def model_label(model_id: str) -> str:
+    return MODEL_LABELS.get(model_id, model_id)
+
+
+def model_cache_dir(model_id: str) -> Path:
+    cache_home = configure_huggingface_cache()
+    hub_dir = Path(os.environ.get("HF_HUB_CACHE", str(cache_home / "hub")))
+    return hub_dir / ("models--" + model_id.replace("/", "--"))
+
+
+def local_snapshot_dir(model_id: str) -> Path | None:
+    """Locate the cached snapshot folder without importing huggingface_hub."""
+
+    repo_dir = model_cache_dir(model_id)
+    snapshots = repo_dir / "snapshots"
+    if not snapshots.is_dir():
+        return None
+    head = repo_dir / "refs" / "main"
+    if head.is_file():
+        try:
+            pinned = snapshots / head.read_text(encoding="utf-8").strip()
+        except OSError:
+            pinned = None
+        if pinned is not None and pinned.is_dir():
+            return pinned
+    folders = [item for item in snapshots.iterdir() if item.is_dir()]
+    if not folders:
+        return None
+    return max(folders, key=lambda item: item.stat().st_mtime)
+
+
+def _snapshot_files(snapshot: Path) -> list[Path]:
+    return [item for item in snapshot.rglob("*") if item.is_file()]
+
+
+def inspect_model(model_id: str) -> ModelStatus:
+    """Report whether one model is fully downloaded in the local cache."""
+
+    label = model_label(model_id)
+    snapshot = local_snapshot_dir(model_id)
+    if snapshot is None:
+        return ModelStatus(model_id, label, False, "尚未下載")
+
+    files = _snapshot_files(snapshot)
+    if not any(item.name == "config.json" for item in files):
+        return ModelStatus(model_id, label, False, "快取不完整（缺少 config.json）", snapshot)
+
+    weights = [item for item in files if item.suffix in _WEIGHT_SUFFIXES]
+    if not weights:
+        return ModelStatus(model_id, label, False, "快取不完整（缺少權重檔）", snapshot)
+
+    total = 0
+    for item in files:
+        try:
+            total += item.stat().st_size
+        except OSError:
+            return ModelStatus(model_id, label, False, "快取損毀（檔案連結失效）", snapshot)
+    if any(item.stat().st_size == 0 for item in weights):
+        return ModelStatus(model_id, label, False, "快取不完整（權重檔為空）", snapshot)
+    if any((model_cache_dir(model_id) / "blobs").glob("*.incomplete")):
+        return ModelStatus(model_id, label, False, "上次下載未完成", snapshot)
+
+    return ModelStatus(model_id, label, True, f"已備妥（{_format_bytes(total)}）", snapshot, total)
+
+
+def check_models(model_ids: Sequence[str] = REQUIRED_MODELS) -> list[ModelStatus]:
+    return [inspect_model(model_id) for model_id in model_ids]
+
+
+def models_ready(model_ids: Sequence[str] = REQUIRED_MODELS) -> bool:
+    return all(status.ready for status in check_models(model_ids))
+
+
+def _progress_reporter(progress: Any) -> Any:
+    """Normalise the optional callback into progress(message, fraction)."""
+
+    if progress is None:
+        return lambda message, fraction=None: None
+
+    def report(message: str, fraction: float | None = None) -> None:
+        try:
+            progress(message, fraction)
+        except Exception:
+            pass
+
+    return report
+
+
+def _download_progress_tqdm(report: Any) -> Any:
+    """A silent tqdm subclass that forwards aggregate byte progress instead."""
+
+    try:
+        from tqdm.auto import tqdm as base_tqdm
+    except ImportError:
+        return None
+
+    import threading
+
+    lock = threading.Lock()
+    state = {"total": 0, "done": 0, "last": 0.0}
+
+    class ProgressTqdm(base_tqdm):  # type: ignore[misc]
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            kwargs["disable"] = True
+            super().__init__(*args, **kwargs)
+            with lock:
+                state["total"] += int(self.total or 0)
+
+        def update(self, n: int | None = 1) -> Any:
+            with lock:
+                state["done"] += int(n or 0)
+                total, done = state["total"], state["done"]
+                now = time.monotonic()
+                due = now - state["last"] >= 0.5
+                if due:
+                    state["last"] = now
+            if due and total > 0:
+                fraction = min(done / total, 1.0)
+                report(
+                    f"下載中：{_format_bytes(done)} / {_format_bytes(total)}",
+                    fraction,
+                )
+            return super().update(n)
+
+    return ProgressTqdm
+
+
+class _CacheGrowthReporter:
+    """Fallback progress: poll the repo cache size when tqdm hooks are absent."""
+
+    def __init__(self, model_id: str, report: Any) -> None:
+        import threading
+
+        self._repo_dir = model_cache_dir(model_id)
+        self._report = report
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+
+    def _current_bytes(self) -> int:
+        total = 0
+        blobs = self._repo_dir / "blobs"
+        if not blobs.is_dir():
+            return 0
+        for item in blobs.iterdir():
+            try:
+                total += item.stat().st_size
+            except OSError:
+                continue
+        return total
+
+    def _run(self) -> None:
+        while not self._stop.wait(1.0):
+            self._report(f"下載中：{_format_bytes(self._current_bytes())}", None)
+
+    def __enter__(self) -> "_CacheGrowthReporter":
+        self._thread.start()
+        return self
+
+    def __exit__(self, *_exc: Any) -> None:
+        self._stop.set()
+
+
+def _snapshot_download_callable() -> Any:
+    try:
+        from huggingface_hub import snapshot_download
+    except ImportError as exc:
+        raise RuntimeError(
+            "缺少 huggingface-hub 套件，請先執行：pip install -r requirements.txt"
+        ) from exc
+    return snapshot_download
+
+
+def download_model(model_id: str, progress: Any = None, force: bool = False) -> ModelStatus:
+    """Fetch one model into the project cache; no ASR model is loaded into RAM."""
+
+    configure_huggingface_cache()
+    report = _progress_reporter(progress)
+    status = inspect_model(model_id)
+    if status.ready and not force:
+        report(f"{status.label}：{status.detail}，略過下載", 1.0)
+        return status
+
+    snapshot_download = _snapshot_download_callable()
+    os.environ.pop("HF_HUB_OFFLINE", None)
+    report(f"{model_label(model_id)}：開始下載 {model_id}", 0.0)
+
+    kwargs: dict[str, Any] = {"repo_id": model_id}
+    tqdm_class = _download_progress_tqdm(report)
+    names, accepts_kwargs = _supported_parameters(snapshot_download)
+    if tqdm_class is not None and ("tqdm_class" in names or accepts_kwargs):
+        kwargs["tqdm_class"] = tqdm_class
+    try:
+        if "tqdm_class" in kwargs:
+            snapshot_download(**kwargs)
+        else:
+            with _CacheGrowthReporter(model_id, report):
+                snapshot_download(**kwargs)
+    except Exception as exc:
+        raise RuntimeError(f"{model_label(model_id)} 下載失敗：{exc}") from exc
+
+    status = inspect_model(model_id)
+    if not status.ready:
+        raise RuntimeError(f"{status.label} 下載後仍不完整：{status.detail}")
+    report(f"{status.label}：{status.detail}", 1.0)
+    return status
+
+
+def download_models(
+    model_ids: Sequence[str] = REQUIRED_MODELS,
+    progress: Any = None,
+    force: bool = False,
+) -> list[ModelStatus]:
+    """Download every required model, reporting one overall 0..1 fraction."""
+
+    report = _progress_reporter(progress)
+    model_ids = list(model_ids)
+    statuses: list[ModelStatus] = []
+    for index, model_id in enumerate(model_ids):
+
+        def step(message: str, fraction: float | None = None, index: int = index) -> None:
+            if fraction is None:
+                report(message, None)
+                return
+            report(message, (index + fraction) / len(model_ids))
+
+        statuses.append(download_model(model_id, progress=step, force=force))
+    report("全部模型已備妥。", 1.0)
+    return statuses
+
+
+def _missing_models_error(missing: Sequence[ModelStatus]) -> RuntimeError:
+    detail = "、".join(f"{status.label}（{status.detail}）" for status in missing)
+    return RuntimeError(
+        f"模型尚未備妥：{detail}。請先按下 GUI 的「下載 / 更新模型」按鈕，"
+        "或執行 python transcribe.py --download-models。"
+    )
+
+
+def ensure_models_ready(
+    model_ids: Sequence[str] = REQUIRED_MODELS,
+    allow_download: bool = False,
+    progress: Any = None,
+) -> list[ModelStatus]:
+    """Raise an actionable error instead of downloading mid-transcription."""
+
+    statuses = check_models(model_ids)
+    missing = [status for status in statuses if not status.ready]
+    if not missing:
+        return statuses
+    if allow_download:
+        download_models([status.model_id for status in missing], progress=progress)
+        return check_models(model_ids)
+    raise _missing_models_error(missing)
+
+
+def resolve_asr_candidates(
+    asr_model: str | None = None,
+    aligner_model: str = DEFAULT_ALIGNER_MODEL,
+    allow_download: bool = False,
+    progress: Any = None,
+) -> tuple[str, ...]:
+    """Return the ASR ids usable offline, after checking the aligner is cached."""
+
+    if allow_download:
+        ensure_models_ready(
+            [asr_model or TEA_ASR_MLX_MODEL, aligner_model],
+            allow_download=True,
+            progress=progress,
+        )
+        return (asr_model,) if asr_model else DEFAULT_ASR_CANDIDATES
+
+    candidates = (asr_model,) if asr_model else DEFAULT_ASR_CANDIDATES
+    ready = tuple(status.model_id for status in check_models(candidates) if status.ready)
+    missing = [] if ready else [inspect_model(candidates[0])]
+    aligner_status = inspect_model(aligner_model)
+    if not aligner_status.ready:
+        missing.append(aligner_status)
+    if missing:
+        raise _missing_models_error(missing)
+    return ready
+
+
+# --- 執行環境套件檢查 / 安裝：模擬「全新未安裝過的電腦」 ------------------------
+#
+# 這裡的檢查全部只用 importlib.util.find_spec / importlib.metadata 與
+# shutil.which，不會 import 任何一個重型套件（mlx、numpy...），所以在完全
+# 沒裝任何依賴的乾淨環境也能安全跑，用來畫出「每個套件各自獨立」的安裝狀態列。
+
+@dataclass
+class DependencyStatus:
+    """One required Python package or system binary's install state."""
+
+    key: str
+    label: str
+    kind: str  # "python" | "binary"
+    installed: bool
+    detail: str
+    pip_requirement: str | None = None
+    install_hint: str | None = None
+
+
+# (import 名稱, requirements.txt 內對應套件名, 顯示用標籤)
+REQUIRED_PYTHON_PACKAGES: tuple[tuple[str, str, str], ...] = (
+    ("customtkinter", "customtkinter", "GUI 介面套件 (customtkinter)"),
+    ("mlx", "mlx", "Apple MLX 運算框架"),
+    ("mlx_audio", "mlx-audio", "MLX 語音辨識套件 (mlx-audio)"),
+    ("numpy", "numpy", "數值運算套件 (numpy)"),
+    ("soundfile", "soundfile", "音訊讀寫套件 (soundfile)"),
+    ("opencc", "opencc-python-reimplemented", "簡繁轉換套件 (opencc)"),
+    ("huggingface_hub", "huggingface-hub", "模型下載套件 (huggingface-hub)"),
+)
+
+# (執行檔名稱, brew 套件名稱, 顯示用標籤)
+REQUIRED_BINARIES: tuple[tuple[str, str, str], ...] = (
+    ("ffmpeg", "ffmpeg", "音訊/影片轉檔工具 (ffmpeg)"),
+    ("ffprobe", "ffmpeg", "媒體資訊探測工具 (ffprobe)"),
+)
+
+
+def _requirement_line_for(pip_name: str) -> str:
+    """Return the exact pinned line from requirements.txt, else the bare name."""
+
+    base = pip_name.split("[")[0].lower()
+    req_file = PROJECT_DIR / "requirements.txt"
+    try:
+        lines = req_file.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return pip_name
+    for line in lines:
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        name = re.split(r"[\[=<>!~]", line, maxsplit=1)[0].strip().lower()
+        if name == base:
+            return line
+    return pip_name
+
+
+def inspect_python_package(import_name: str, pip_name: str, label: str) -> DependencyStatus:
+    """Check via find_spec/metadata only — never actually imports the package."""
+
+    spec = importlib.util.find_spec(import_name)
+    if spec is None:
+        return DependencyStatus(
+            import_name, label, "python", False, "尚未安裝",
+            pip_requirement=_requirement_line_for(pip_name),
+        )
+    try:
+        version = importlib_metadata.version(pip_name.split("[")[0])
+    except importlib_metadata.PackageNotFoundError:
+        version = None
+    detail = f"已安裝（v{version}）" if version else "已安裝"
+    return DependencyStatus(import_name, label, "python", True, detail)
+
+
+def inspect_binary(binary_name: str, brew_package: str, label: str) -> DependencyStatus:
+    path = shutil.which(binary_name)
+    if path:
+        return DependencyStatus(binary_name, label, "binary", True, f"已安裝（{path}）")
+    return DependencyStatus(
+        binary_name, label, "binary", False, "尚未安裝",
+        install_hint=f"brew install {brew_package}",
+    )
+
+
+def check_dependencies() -> list[DependencyStatus]:
+    statuses = [inspect_python_package(*item) for item in REQUIRED_PYTHON_PACKAGES]
+    statuses += [inspect_binary(*item) for item in REQUIRED_BINARIES]
+    return statuses
+
+
+def dependencies_ready() -> bool:
+    return all(status.installed for status in check_dependencies())
+
+
+def install_python_packages(
+    packages: Sequence[str] | None = None,
+    progress: Any = None,
+) -> None:
+    """pip-install the given (or all currently-missing) required packages.
+
+    Runs `sys.executable -m pip install ...` so it always targets whichever
+    interpreter is actually running this GUI/CLI, not some other Python.
+    """
+
+    report = _progress_reporter(progress)
+    statuses = [s for s in check_dependencies() if s.kind == "python"]
+    if packages is None:
+        targets = [s.pip_requirement or s.key for s in statuses if not s.installed]
+    else:
+        wanted = set(packages)
+        targets = [
+            s.pip_requirement or s.key for s in statuses if s.key in wanted
+        ]
+
+    if not targets:
+        report("所有 Python 套件皆已安裝，略過安裝。", 1.0)
+        return
+
+    report(f"開始安裝：{', '.join(targets)}", 0.0)
+    command = [sys.executable, "-m", "pip", "install", "--upgrade", *targets]
+    process = subprocess.Popen(
+        command,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        bufsize=1,
+    )
+    assert process.stdout is not None
+    for line in process.stdout:
+        line = line.rstrip()
+        if line:
+            report(line, None)
+    process.wait()
+    if process.returncode != 0:
+        raise RuntimeError(f"pip install 失敗（exit code {process.returncode}）：{', '.join(targets)}")
+    report("Python 套件安裝完成。", 1.0)
+
+
+def install_binary(binary_name: str, brew_package: str, progress: Any = None) -> None:
+    """Install one system tool via Homebrew; raises with guidance if brew is absent."""
+
+    report = _progress_reporter(progress)
+    brew = shutil.which("brew")
+    if not brew:
+        raise RuntimeError(
+            f"找不到 Homebrew，無法自動安裝 {binary_name}。"
+            f"請先安裝 Homebrew (https://brew.sh)，再執行 brew install {brew_package}。"
+        )
+    report(f"開始安裝：brew install {brew_package}", 0.0)
+    process = subprocess.Popen(
+        [brew, "install", brew_package],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        bufsize=1,
+    )
+    assert process.stdout is not None
+    for line in process.stdout:
+        line = line.rstrip()
+        if line:
+            report(line, None)
+    process.wait()
+    if process.returncode != 0:
+        raise RuntimeError(f"brew install {brew_package} 失敗（exit code {process.returncode}）")
+    report(f"{binary_name} 安裝完成。", 1.0)
 
 
 def _run_command(command: Sequence[str]) -> subprocess.CompletedProcess[str]:
@@ -1288,11 +1829,21 @@ def run_transcription(
     keep_temp: bool = False,
     no_punctuation: bool = False,
     verbose: bool = False,
+    allow_download: bool = False,
 ) -> tuple[tuple[Path, Path, Path], TranscriptBundle]:
     if platform.machine().lower() not in {"arm64", "aarch64"}:
         raise RuntimeError("此工具只允許在 Apple Silicon arm64 上執行。")
     if chunk_seconds > MAX_ALIGNMENT_SECONDS - 10.0:
         raise ValueError("chunk_seconds 不可超過 260 秒，需保留 ForcedAligner 的長度安全邊界")
+
+    # 模型必須事前備妥；預設不在轉錄途中連網下載。
+    candidates = resolve_asr_candidates(
+        asr_model=asr_model,
+        aligner_model=aligner_model,
+        allow_download=allow_download,
+    )
+    if not allow_download:
+        os.environ["HF_HUB_OFFLINE"] = "1"
 
     started = time.perf_counter()
     media = probe_media(input_path)
@@ -1329,7 +1880,6 @@ def run_transcription(
             for chunk in chunks
         ]
 
-        candidates = (asr_model,) if asr_model else DEFAULT_ASR_CANDIDATES
         candidate_errors: list[str] = []
         for candidate in candidates:
             candidate_model = None
@@ -1445,7 +1995,12 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="在 Apple Silicon Mac 上將影片/音訊轉成繁體中文字幕 SRT、TXT、JSON。"
     )
-    parser.add_argument("input", type=Path, help="mp4/mov/mkv/mp3/wav/m4a 等本機檔案")
+    parser.add_argument(
+        "input",
+        type=Path,
+        nargs="?",
+        help="mp4/mov/mkv/mp3/wav/m4a 等本機檔案；搭配 --check-models/--download-models 時可省略",
+    )
     parser.add_argument("--output-dir", type=Path, default=None, help="輸出資料夾；預設為輸入檔所在目錄")
     parser.add_argument("--asr-model", default=None, help="指定單一 ASR model；預設依序探測 TEA/Qwen")
     parser.add_argument("--aligner-model", default=DEFAULT_ALIGNER_MODEL)
@@ -1461,11 +2016,114 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--keep-temp", action="store_true")
     parser.add_argument("--verbose", action="store_true")
+    parser.add_argument(
+        "--check-models",
+        action="store_true",
+        help="只檢查模型是否已下載到本機快取，不進行轉錄",
+    )
+    parser.add_argument(
+        "--download-models",
+        action="store_true",
+        help="事前下載所有必要模型，不進行轉錄",
+    )
+    parser.add_argument(
+        "--force-download",
+        action="store_true",
+        help="搭配 --download-models：即使已存在也重新下載",
+    )
+    parser.add_argument(
+        "--allow-download",
+        action="store_true",
+        help="允許轉錄途中補下載模型；預設關閉，模型缺少時直接報錯",
+    )
+    parser.add_argument(
+        "--check-deps",
+        action="store_true",
+        help="檢查本機是否已安裝所有必要的 Python 套件與系統工具（ffmpeg），不進行轉錄",
+    )
+    parser.add_argument(
+        "--install-deps",
+        action="store_true",
+        help="安裝所有缺少的 Python 套件（pip install），不進行轉錄；ffmpeg 等系統工具仍需自行安裝",
+    )
+    parser.add_argument(
+        "--model-dir",
+        type=Path,
+        default=None,
+        help="指定 AI 模型的存放目錄並記住（寫入 config.json）；預設為 models/huggingface",
+    )
+    parser.add_argument(
+        "--move-existing-models",
+        action="store_true",
+        help="搭配 --model-dir：把舊目錄底下已下載的模型搬到新目錄，而不是留在原地重新下載",
+    )
     return parser.parse_args(argv)
+
+
+def _print_model_progress(message: str, fraction: float | None = None) -> None:
+    suffix = f" ({fraction * 100:.1f}%)" if fraction is not None else ""
+    print(f"[MODEL] {message}{suffix}", flush=True)
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(argv)
+
+    if args.model_dir is not None:
+        try:
+            resolved = set_model_dir(
+                args.model_dir,
+                move_existing=args.move_existing_models,
+                progress=_print_model_progress,
+            )
+        except Exception as exc:
+            print(f"ERROR: {type(exc).__name__}: {exc}", file=sys.stderr)
+            return 1
+        print(f"模型存放目錄已設定為：{resolved}")
+
+    if args.check_deps:
+        statuses = check_dependencies()
+        for status in statuses:
+            mark = "OK" if status.installed else "MISSING"
+            print(f"[{mark}] {status.label}: {status.detail}")
+            if not status.installed and status.install_hint:
+                print(f"       -> {status.install_hint}")
+        return 0 if all(status.installed for status in statuses) else 1
+
+    if args.install_deps:
+        try:
+            install_python_packages(progress=_print_model_progress)
+        except Exception as exc:
+            print(f"ERROR: {type(exc).__name__}: {exc}", file=sys.stderr)
+            return 1
+        for status in check_dependencies():
+            mark = "OK" if status.installed else "MISSING"
+            print(f"[{mark}] {status.label}: {status.detail}")
+        return 0
+
+    if args.download_models:
+        try:
+            statuses = download_models(
+                progress=_print_model_progress, force=args.force_download
+            )
+        except Exception as exc:
+            print(f"ERROR: {type(exc).__name__}: {exc}", file=sys.stderr)
+            return 1
+        for status in statuses:
+            print(f"{status.label}: {status.detail}")
+        return 0
+
+    if args.check_models:
+        print(f"模型存放目錄：{get_model_dir()}")
+        statuses = check_models()
+        for status in statuses:
+            mark = "OK" if status.ready else "MISSING"
+            print(f"[{mark}] {status.label} ({status.model_id}): {status.detail}")
+        return 0 if all(status.ready for status in statuses) else 1
+
+    if args.input is None:
+        print("ERROR: 缺少輸入檔案；請提供影音檔或改用 --check-models/--download-models", file=sys.stderr)
+        return 1
+
     configured_hotwords = [] if args.no_default_hotwords else list(HOTWORDS)
     configured_hotwords.extend(args.hotword)
     try:
@@ -1481,6 +2139,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             keep_temp=args.keep_temp,
             no_punctuation=args.no_punctuation,
             verbose=args.verbose,
+            allow_download=args.allow_download,
         )
     except Exception as exc:
         print(f"ERROR: {type(exc).__name__}: {exc}", file=sys.stderr)
@@ -1494,6 +2153,28 @@ def main(argv: Sequence[str] | None = None) -> int:
     if bundle.warnings:
         print(f"Warnings: {len(bundle.warnings)}")
     return 0
+
+
+# transcribe.py 最底部
+
+def transcribe_file(
+    file_path: str,
+    output_dir: str | Path | None = None,
+    allow_download: bool = False,
+):
+    """供 GUI 呼叫的轉錄入口函式。
+
+    模型必須事前用 download_models() 備妥；allow_download 預設 False，
+    因此轉錄途中不會突然開始下載。
+    """
+
+    paths, _bundle = run_transcription(
+        input_path=Path(file_path),
+        output_dir=Path(output_dir) if output_dir else None,
+        verbose=True,
+        allow_download=allow_download,
+    )
+    return paths[0]  # 回傳產出的 SRT 檔案路徑
 
 
 if __name__ == "__main__":

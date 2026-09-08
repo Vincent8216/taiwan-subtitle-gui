@@ -1,0 +1,21 @@
+# Python 虛擬環境
+.venv/
+__pycache__/
+*.pyc
+
+# 使用者本機狀態，不該進版控
+config.json
+.DS_Store
+
+# AI 模型快取（GB 等級，用 GUI／CLI 的下載功能各自取得）
+models/
+
+# 執行期產生的暫存與輸出
+tmp/
+output/
+
+# 個人測試用影音檔與轉錄結果
+input_file/
+
+# 編輯備份
+transcribe.py.bak
