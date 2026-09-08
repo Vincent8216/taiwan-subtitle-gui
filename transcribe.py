@@ -32,7 +32,17 @@ from typing import Any, Iterable, Sequence
 
 
 PROJECT_DIR = Path(__file__).resolve().parent
-DEFAULT_HF_HOME = PROJECT_DIR / "models" / "huggingface"
+
+# 打包成 .app 後，__file__ 會指向 bundle 內部（例如 Contents/Frameworks/）——
+# 那裡不該存放會持續變動、GB 等級的模型快取或使用者設定，而且下次重新打包
+# 就會被整個清空。frozen 執行時改用系統慣例的使用者資料目錄；一般以原始碼
+# 執行（python transcribe.py / python gui.py）時則沿用專案內的資料夾，行為不變。
+if getattr(sys, "frozen", False):
+    APP_DATA_DIR = Path.home() / "Library" / "Application Support" / "TaiwanSubtitle"
+else:
+    APP_DATA_DIR = PROJECT_DIR
+
+DEFAULT_HF_HOME = APP_DATA_DIR / "models" / "huggingface"
 TEA_ASR_MLX_MODEL = "Alkd/TEA-ASR-1.1-MLX-4bit"
 TEA_ASR_MLX_COMPATIBILITY_NOTE = (
     "套用 TEA-ASR-1.1 MLX 模型卡要求的 quantization predicate，讓 8-bit audio tower "
@@ -175,7 +185,7 @@ def _require_soundfile() -> Any:
     return sf
 
 
-CONFIG_PATH = PROJECT_DIR / "config.json"
+CONFIG_PATH = APP_DATA_DIR / "config.json"
 
 
 def load_config() -> dict[str, Any]:
@@ -660,6 +670,13 @@ def install_python_packages(
     Runs `sys.executable -m pip install ...` so it always targets whichever
     interpreter is actually running this GUI/CLI, not some other Python.
     """
+
+    if getattr(sys, "frozen", False):
+        raise RuntimeError(
+            "這是打包好的 App，所有必要套件已內建，沒有可用的 pip。"
+            "若真的缺套件，代表這個 App build 有問題，請回報或改用原始碼＋"
+            "requirements.txt 執行。"
+        )
 
     report = _progress_reporter(progress)
     statuses = [s for s in check_dependencies() if s.kind == "python"]
@@ -1850,7 +1867,7 @@ def run_transcription(
     output_dir = Path(output_dir).expanduser().resolve() if output_dir else media.path.parent
     warnings: list[str] = []
     context = build_context(hotwords)
-    temp_root = PROJECT_DIR / "tmp"
+    temp_root = APP_DATA_DIR / "tmp"
     temp_root.mkdir(parents=True, exist_ok=True)
     temp_dir = Path(tempfile.mkdtemp(prefix="run-", dir=str(temp_root)))
     model = None

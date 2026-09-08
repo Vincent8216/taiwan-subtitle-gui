@@ -667,6 +667,14 @@ if _has_customtkinter():
 
 
 if __name__ == "__main__":
+    import multiprocessing
+
+    # 打包成 .app 後 sys.executable 變成這個凍結執行檔本身，不是通用的
+    # python 直譯器；multiprocessing 在某些情況下會嘗試用它 spawn 輔助行程
+    # （例如 resource_tracker），freeze_support() 是 PyInstaller 官方建議的
+    # 標準防護，避免那類輔助行程失敗時印出無害但嚇人的警告。
+    multiprocessing.freeze_support()
+
     if _has_customtkinter():
         app = ModernTranscribeApp()
     else:

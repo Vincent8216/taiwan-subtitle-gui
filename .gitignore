@@ -19,3 +19,7 @@ input_file/
 
 # 編輯備份
 transcribe.py.bak
+
+# PyInstaller 打包產物（App/DMG 幾百 MB 起跳，改用 GitHub Release 附件發佈）
+build/
+dist/
