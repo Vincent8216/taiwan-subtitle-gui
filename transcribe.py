@@ -654,6 +654,22 @@ def inspect_python_package(import_name: str, pip_name: str, label: str) -> Depen
 
 def inspect_binary(binary_name: str, brew_package: str, label: str) -> DependencyStatus:
     path = shutil.which(binary_name)
+    if not path:
+        # 如果 shutil.which 找不到（例如 GUI App 的 PATH 不完整），
+        # 嘗試直接執行看看是否能成功，這樣已安裝的工具就不會誤報為缺失
+        try:
+            subprocess.run(
+                [binary_name, "--version"],
+                capture_output=True,
+                timeout=2,
+                check=True,
+            )
+            path = f"（已安裝但路徑不在 PATH）"
+        except (FileNotFoundError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
+            return DependencyStatus(
+                binary_name, label, "binary", False, "尚未安裝",
+                install_hint=f"brew install {brew_package}",
+            )
     if path:
         return DependencyStatus(binary_name, label, "binary", True, f"已安裝（{path}）")
     return DependencyStatus(
@@ -822,10 +838,23 @@ def install_binary(binary_name: str, brew_package: str, progress: Any = None) ->
 
     report = _progress_reporter(progress)
     brew = shutil.which("brew")
+
+    # macOS App 通過 GUI 啟動時 PATH 可能不完整，檢查常見的 Homebrew 位置
+    if not brew:
+        for common_path in [
+            "/opt/homebrew/bin/brew",
+            "/usr/local/bin/brew",
+            Path.home() / ".homebrew" / "bin" / "brew",
+        ]:
+            if Path(common_path).exists():
+                brew = common_path
+                break
+
     if not brew:
         raise RuntimeError(
-            f"找不到 Homebrew，無法自動安裝 {binary_name}。"
-            f"請先安裝 Homebrew (https://brew.sh)，再執行 brew install {brew_package}。"
+            f"找不到 Homebrew，無法自動安裝 {binary_name}。\n"
+            f"請先安裝 Homebrew (https://brew.sh)，\n"
+            f"再執行：brew install {brew_package}"
         )
     report(f"開始安裝：brew install {brew_package}", 0.0)
     process = subprocess.Popen(
