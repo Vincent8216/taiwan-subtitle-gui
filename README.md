@@ -116,11 +116,49 @@ python -m pip install --upgrade pip
 
 ## 4. 安裝套件
 
+### 推薦方式（精確可重現環境）⭐
+
 ```bash
-python -m pip install -r requirements.txt
+python -m pip install -r requirements.lock
 ```
 
-`requirements.txt` 涵蓋 GUI（customtkinter）與轉錄流程（mlx、mlx-audio、numpy、soundfile、opencc、huggingface-hub）需要的全部 Python 套件；FFmpeg／FFprobe 是系統工具，走 Homebrew 安裝，不在這份清單裡。
+`requirements.lock` 是精確鎖定的依賴檔，包含所有直接和間接依賴的版本號。使用 lock 檔可保證環境完全可重現：
+- ✅ 「在 A 機器能跑，在 B 機器也能跑」
+- ✅ 依賴版本明確，no surprises
+- ✅ CI/CD 環境最佳化
+
+### 替代方式（更新依賴時使用）
+
+如果想要最新版本的直接依賴，改用：
+```bash
+python -m pip install -r requirements.in
+```
+
+`requirements.in` 只包含直接依賴（customtkinter、mlx、numpy 等），pip 會自動解析和安裝間接依賴的最新相容版本。
+
+### 更新依賴流程
+
+若需要升級依賴（例如 mlx 從 0.32.2 → 0.33.0）：
+
+```bash
+# 1. 編輯 requirements.in
+vim requirements.in  # 改 mlx==0.32.2 → mlx==0.33.0
+
+# 2. 重新生成 lock 檔
+pip-compile requirements.in -o requirements.lock
+
+# 3. 本地測試新版本
+pip install -r requirements.lock
+python transcribe.py --check-deps
+
+# 4. 確認無誤後提交
+git add requirements.in requirements.lock
+git commit -m "deps: upgrade mlx to 0.33.0"
+```
+
+### 詳細說明
+
+`requirements.lock` 涵蓋 GUI（customtkinter）與轉錄流程（mlx、mlx-audio、numpy、soundfile、opencc、huggingface-hub）需要的**全部** Python 套件及其間接依賴；FFmpeg／FFprobe 是系統工具，走 Homebrew 安裝，不在這份清單裡。
 
 **不確定套件裝得夠不夠齊？** 兩種方式都能逐一確認每個套件的安裝狀態，不用自己猜：
 
