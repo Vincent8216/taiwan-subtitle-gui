@@ -86,13 +86,9 @@ class DependencyBootstrap(tk.Tk):
         self.recheck_btn = tk.Button(btn_frame, text="重新檢查", command=self.start_check)
         self.recheck_btn.pack(side="left", padx=4)
         self.install_btn = tk.Button(
-            btn_frame, text="安裝缺少的 Python 套件", command=self.start_install
+            btn_frame, text="安裝缺少的套件", command=self.start_install
         )
         self.install_btn.pack(side="left", padx=4)
-        self.install_ffmpeg_btn = tk.Button(
-            btn_frame, text="安裝 FFmpeg (brew)", command=self.start_install_ffmpeg
-        )
-        self.install_ffmpeg_btn.pack(side="left", padx=4)
         self.restart_btn = tk.Button(
             btn_frame,
             text="安裝完成，重新啟動",
@@ -130,7 +126,6 @@ class DependencyBootstrap(tk.Tk):
         state = "disabled" if busy else "normal"
         self.recheck_btn.configure(state=state)
         self.install_btn.configure(state=state)
-        self.install_ffmpeg_btn.configure(state=state)
 
     # ---------- 檢查 ----------
 
@@ -164,29 +159,19 @@ class DependencyBootstrap(tk.Tk):
 
     def start_install(self):
         self.set_busy(True)
-        self.log("\n開始安裝缺少的 Python 套件...")
+        self.log("\n開始安裝缺少的套件...")
         threading.Thread(target=self._install_task, daemon=True).start()
 
     def _install_task(self):
         try:
             transcribe.install_python_packages(progress=lambda m, f=None: self.log(m))
             self.log("Python 套件安裝完成。")
+            if not transcribe.inspect_binary("ffmpeg", "ffmpeg", "FFmpeg").installed:
+                self.log("接著安裝 FFmpeg（Homebrew）...")
+                transcribe.install_binary("ffmpeg", "ffmpeg", progress=lambda m, f=None: self.log(m))
+                self.log("FFmpeg 安裝完成。")
         except Exception as exc:
             self.log(f"安裝失敗：{exc}")
-        finally:
-            self._check_task()
-
-    def start_install_ffmpeg(self):
-        self.set_busy(True)
-        self.log("\n嘗試以 Homebrew 安裝 FFmpeg...")
-        threading.Thread(target=self._install_ffmpeg_task, daemon=True).start()
-
-    def _install_ffmpeg_task(self):
-        try:
-            transcribe.install_binary("ffmpeg", "ffmpeg", progress=lambda m, f=None: self.log(m))
-            self.log("FFmpeg 安裝完成。")
-        except Exception as exc:
-            self.log(f"FFmpeg 安裝失敗：{exc}")
         finally:
             self._check_task()
 
@@ -270,23 +255,13 @@ if _has_customtkinter():
 
             self.dep_install_btn = ctk.CTkButton(
                 self.dep_btn_frame,
-                text="安裝缺少的 Python 套件",
+                text="安裝缺少的套件",
                 height=28,
                 width=170,
                 font=ctk.CTkFont(size=12),
                 command=self.start_install_deps,
             )
-            self.dep_install_btn.pack(side="left", padx=(0, 8))
-
-            self.dep_install_ffmpeg_btn = ctk.CTkButton(
-                self.dep_btn_frame,
-                text="安裝 FFmpeg (brew)",
-                height=28,
-                width=140,
-                font=ctk.CTkFont(size=12),
-                command=self.start_install_ffmpeg,
-            )
-            self.dep_install_ffmpeg_btn.pack(side="left")
+            self.dep_install_btn.pack(side="left")
 
             # --- 2. 語言模型狀態與下載面板 ---
             self.model_box = ctk.CTkFrame(self.card, corner_radius=10)
@@ -434,7 +409,6 @@ if _has_customtkinter():
             state = "disabled" if busy else "normal"
             self.dep_recheck_btn.configure(state=state)
             self.dep_install_btn.configure(state=state)
-            self.dep_install_ffmpeg_btn.configure(state=state)
             self.change_dir_btn.configure(state=state)
             self.recheck_btn.configure(state=state)
             self.download_btn.configure(state=state)
@@ -481,42 +455,27 @@ if _has_customtkinter():
                 missing = [s.label for s in statuses if not s.installed]
                 self.log(
                     "尚未安裝：" + "、".join(missing) + "\n"
-                    "Python 套件可按「安裝缺少的 Python 套件」；"
-                    "FFmpeg 請按「安裝 FFmpeg (brew)」或手動安裝。"
+                    "請按「安裝缺少的套件」，Python 套件與 FFmpeg 會一併安裝。"
                 )
 
         def start_install_deps(self):
             self.set_busy(True)
             self.set_progress(0.0, "準備安裝套件...")
-            self.log("\n開始安裝缺少的 Python 套件...")
+            self.log("\n開始安裝缺少的套件...")
             self.run_in_background(self.install_deps_process)
 
         def install_deps_process(self):
             try:
                 transcribe.install_python_packages(progress=self.on_deps_progress)
                 self.log("Python 套件安裝完成！")
+                if not transcribe.inspect_binary("ffmpeg", "ffmpeg", "FFmpeg").installed:
+                    self.log("接著安裝 FFmpeg（Homebrew）...")
+                    transcribe.install_binary("ffmpeg", "ffmpeg", progress=self.on_deps_progress)
+                    self.log("FFmpeg 安裝完成！")
                 self.check_deps_now()
                 self.set_progress(1.0, "套件已安裝")
             except Exception as exc:
                 self.log(f"安裝失敗：{exc}")
-                self.set_progress(0.0, "安裝失敗")
-            finally:
-                self.set_busy(False)
-
-        def start_install_ffmpeg(self):
-            self.set_busy(True)
-            self.set_progress(0.0, "準備安裝 FFmpeg...")
-            self.log("\n嘗試以 Homebrew 安裝 FFmpeg...")
-            self.run_in_background(self.install_ffmpeg_process)
-
-        def install_ffmpeg_process(self):
-            try:
-                transcribe.install_binary("ffmpeg", "ffmpeg", progress=self.on_deps_progress)
-                self.log("FFmpeg 安裝完成！")
-                self.check_deps_now()
-                self.set_progress(1.0, "FFmpeg 已安裝")
-            except Exception as exc:
-                self.log(f"FFmpeg 安裝失敗：{exc}")
                 self.set_progress(0.0, "安裝失敗")
             finally:
                 self.set_busy(False)
