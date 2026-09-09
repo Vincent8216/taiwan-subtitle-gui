@@ -653,23 +653,38 @@ def inspect_python_package(import_name: str, pip_name: str, label: str) -> Depen
 
 
 def inspect_binary(binary_name: str, brew_package: str, label: str) -> DependencyStatus:
+    # 首先用 shutil.which 查找（使用當前系統 PATH）
     path = shutil.which(binary_name)
+
     if not path:
-        # 如果 shutil.which 找不到（例如 GUI App 的 PATH 不完整），
-        # 嘗試直接執行看看是否能成功，這樣已安裝的工具就不會誤報為缺失
+        # 如果 shutil.which 找不到，檢查常見的 Homebrew 位置
+        for common_path in [
+            "/opt/homebrew/bin",
+            "/usr/local/bin",
+            str(Path.home() / ".homebrew" / "bin"),
+        ]:
+            candidate = Path(common_path) / binary_name
+            if candidate.exists():
+                path = str(candidate)
+                break
+
+    if not path:
+        # 都找不到時，嘗試直接執行看看是否能成功
         try:
-            subprocess.run(
+            result = subprocess.run(
                 [binary_name, "--version"],
                 capture_output=True,
                 timeout=2,
                 check=True,
+                text=True,
             )
-            path = f"（已安裝但路徑不在 PATH）"
-        except (FileNotFoundError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
+            path = "（已安裝但路徑不在 PATH）"
+        except (FileNotFoundError, subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError):
             return DependencyStatus(
                 binary_name, label, "binary", False, "尚未安裝",
                 install_hint=f"brew install {brew_package}",
             )
+
     if path:
         return DependencyStatus(binary_name, label, "binary", True, f"已安裝（{path}）")
     return DependencyStatus(
@@ -872,6 +887,13 @@ def install_binary(binary_name: str, brew_package: str, progress: Any = None) ->
     process.wait()
     if process.returncode != 0:
         raise RuntimeError(f"brew install {brew_package} 失敗（exit code {process.returncode}）")
+
+    # 安裝完成後，嘗試更新 PATH 以便後續檢查能找到新安裝的工具
+    # （特別是 GUI App 啟動時 PATH 可能不完整的情況）
+    for common_bin_path in ["/opt/homebrew/bin", "/usr/local/bin"]:
+        if common_bin_path not in os.environ.get("PATH", ""):
+            os.environ["PATH"] = f"{common_bin_path}:{os.environ['PATH']}"
+
     report(f"{binary_name} 安裝完成。", 1.0)
 
 
