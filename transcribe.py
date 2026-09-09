@@ -161,6 +161,9 @@ class ModelInfo:
     compatibility: list[str] = field(default_factory=list)
 
 
+HOMEBREW_BIN_PATHS = ["/opt/homebrew/bin", "/usr/local/bin", str(Path.home() / ".homebrew" / "bin")]
+
+
 @dataclass
 class AlignmentResult:
     tokens: list[TokenTimestamp]
@@ -653,30 +656,22 @@ def inspect_python_package(import_name: str, pip_name: str, label: str) -> Depen
 
 
 def inspect_binary(binary_name: str, brew_package: str, label: str) -> DependencyStatus:
-    # 首先用 shutil.which 查找（使用當前系統 PATH）
     path = shutil.which(binary_name)
 
     if not path:
-        # 如果 shutil.which 找不到，檢查常見的 Homebrew 位置
-        for common_path in [
-            "/opt/homebrew/bin",
-            "/usr/local/bin",
-            str(Path.home() / ".homebrew" / "bin"),
-        ]:
+        for common_path in HOMEBREW_BIN_PATHS:
             candidate = Path(common_path) / binary_name
             if candidate.exists():
                 path = str(candidate)
                 break
 
     if not path:
-        # 都找不到時，嘗試直接執行看看是否能成功
         try:
-            result = subprocess.run(
+            subprocess.run(
                 [binary_name, "--version"],
                 capture_output=True,
                 timeout=2,
                 check=True,
-                text=True,
             )
             path = "（已安裝但路徑不在 PATH）"
         except (FileNotFoundError, subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError):
@@ -685,12 +680,7 @@ def inspect_binary(binary_name: str, brew_package: str, label: str) -> Dependenc
                 install_hint=f"brew install {brew_package}",
             )
 
-    if path:
-        return DependencyStatus(binary_name, label, "binary", True, f"已安裝（{path}）")
-    return DependencyStatus(
-        binary_name, label, "binary", False, "尚未安裝",
-        install_hint=f"brew install {brew_package}",
-    )
+    return DependencyStatus(binary_name, label, "binary", True, f"已安裝（{path}）")
 
 
 def check_dependencies() -> list[DependencyStatus]:
@@ -854,13 +844,8 @@ def install_binary(binary_name: str, brew_package: str, progress: Any = None) ->
     report = _progress_reporter(progress)
     brew = shutil.which("brew")
 
-    # macOS App 通過 GUI 啟動時 PATH 可能不完整，檢查常見的 Homebrew 位置
     if not brew:
-        for common_path in [
-            "/opt/homebrew/bin/brew",
-            "/usr/local/bin/brew",
-            Path.home() / ".homebrew" / "bin" / "brew",
-        ]:
+        for common_path in [f"{p}/brew" for p in HOMEBREW_BIN_PATHS]:
             if Path(common_path).exists():
                 brew = common_path
                 break
@@ -888,11 +873,11 @@ def install_binary(binary_name: str, brew_package: str, progress: Any = None) ->
     if process.returncode != 0:
         raise RuntimeError(f"brew install {brew_package} 失敗（exit code {process.returncode}）")
 
-    # 安裝完成後，嘗試更新 PATH 以便後續檢查能找到新安裝的工具
-    # （特別是 GUI App 啟動時 PATH 可能不完整的情況）
-    for common_bin_path in ["/opt/homebrew/bin", "/usr/local/bin"]:
-        if common_bin_path not in os.environ.get("PATH", ""):
-            os.environ["PATH"] = f"{common_bin_path}:{os.environ['PATH']}"
+    # 安裝完成後更新 PATH，讓後續 inspect_binary() 的 subprocess 檢查能成功
+    current_paths = os.environ.get("PATH", "").split(":")
+    paths_to_add = [p for p in HOMEBREW_BIN_PATHS if p not in current_paths]
+    if paths_to_add:
+        os.environ["PATH"] = ":".join(paths_to_add + current_paths)
 
     report(f"{binary_name} 安裝完成。", 1.0)
 
