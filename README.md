@@ -7,6 +7,59 @@
 
 兩者共用同一套轉錄邏輯，`gui.py` 只是 `transcribe.py` 的圖形外殼。
 
+## 📋 系統要求與效能基準
+
+### 支援的環境
+- **硬體**：Apple Silicon (M1/M1 Pro/M2/M3 系列) 原生執行
+- **作業系統**：macOS 12.0 或更新
+- **RAM**：最低 6 GB；**推薦 16 GB**（避免頻繁換頁）
+- **磁碟空間**：至少 5 GB 空閒（模型 ~2.5 GB + 轉錄暫存 + 輸出檔）
+- **Python**：3.13.x 專用（不支援 3.12、3.14）
+- **FFmpeg**：透過 Homebrew 自動安裝；無最低版本要求（建議 6.1+）
+
+### 不支援
+- ❌ Intel Mac（需要 Rosetta；未測試且效能會大幅下降）
+- ❌ 即時轉錄（不支援 Live 邊錄邊轉）
+- ❌ 多語言混合（當前針對台灣華語最佳化）
+- ❌ GPU 加速切換（MLX 已自動使用 Apple Silicon GPU；無法改用 NVIDIA）
+
+### 效能基準
+
+在 **M1 / 16 GB RAM / 本機 SSD** 環境測試（包含 ASR + Aligner）：
+
+| 音訊長度 | 估計轉錄時間 | 備註 |
+|---------|----------|------|
+| 30 分鐘 | ~5-7 分鐘 | 短音訊，快速完成 |
+| 1 小時 | ~10-15 分鐘 | 一般場景 |
+| 2 小時 | ~20-30 分鐘 | 單進程；不支援並行 |
+
+**影響因素**：
+- 🎙️ **音訊品質**（雜訊多會延長 ASR 推理時間）
+- 💾 **RAM 大小**（不足會頻繁換頁 ➜ 可能增加 50%+ 時間）
+- 💿 **磁碟速度**（SSD 遠快於機械硬碟；外接 USB 可能成為瓶頸）
+- 🔋 **Mac 溫度**（散熱不足時 M 系列會自動降頻）
+
+**M2 Pro/M3/M3 Max 會更快；M1/M1 Pro 則作為基準。**
+
+### 已知限制和風險
+
+⚠️ **依賴版本控制不完整**：
+- `requirements.txt` 鎖定了直接依賴版本，但間接依賴（例如 numpy 依賴的 BLAS）可能變化
+- 風險：「在 A 機器能跑，在 B 機器不行」
+- 改進計畫：預計 2026 Q3 改用 `poetry.lock` 或 `pip-compile` 解決
+
+⚠️ **App 無開發者簽章**：
+- 首次開啟需「右鍵 → 開啟」或執行 `xattr -dr com.apple.quarantine /Applications/TaiwanSubtitle.app`
+- 影響：企業用戶無法使用（IT 政策不允許未簽章軟體）
+- 改進計畫：評估成本效益後考慮申請 Apple Developer Program
+
+⚠️ **模型降級無通知**：
+- 若 TEA-ASR 失敗，會自動改用 Qwen3-ASR（使用者無感知）
+- 風險：字幕品質可能略差（Qwen3 對台灣詞彙最佳化程度較低）
+- 改進計畫：預計 2026 Q3 在 UI 中顯示降級通知
+
+---
+
 ## 0. 不想自己架環境？直接下載打包好的 App
 
 到 [Releases](https://github.com/Vincent8216/taiwan-subtitle-gui/releases) 下載最新的 `TaiwanSubtitle-x.y.z.dmg`（約 20 MB），打開後把 `TaiwanSubtitle.app` 拖進「應用程式」即可，不需要自己架 Python 環境。開啟 App 後，照畫面依序按兩顆按鈕就能補齊所有需要的東西：先按「系統套件」區塊的「安裝缺少的套件」（會一併裝好 Python 套件與 FFmpeg），再按「AI 語音模型」區塊的「下載 / 更新模型」。
@@ -182,6 +235,83 @@ python -m pip install -r requirements.txt pyinstaller
 若之後升級 `mlx`／`mlx-audio` 版本，直接用同一份 spec 重新打包即可；使用者端下次按「安裝缺少的 Python 套件」（或「重新檢查」偵測到版本不同）就會抓到新版。
 
 這個 build 沒有 Apple Developer 簽章／公證，發佈前請先在自己機器上完整跑過一次「系統套件檢查 → 安裝套件 → 下載模型 → 選擇檔案轉錄」確認沒問題。
+
+## 常見問題與故障排除
+
+### Q: 「缺少 numpy，請重新安裝 requirements.txt」
+**A**: 重新安裝套件環境：
+```bash
+source .venv/bin/activate
+python -m pip install --upgrade -r requirements.txt
+# 或在 GUI 中按「重新檢查」和「安裝缺少的套件」
+```
+
+### Q: 轉錄卡住或進度緩慢
+**A**: 
+1. 檢查 Activity Monitor 的內存使用（是否達到 RAM 上限？）
+2. 試試減小 `--chunk-size` (預設 240s)：
+   ```bash
+   python transcribe.py input.mp4 --chunk-size 120 --output-dir output
+   ```
+3. 查看 `output.json` 中的 `warnings` 欄位（是否有降級或失敗記錄？）
+4. 確認外接硬碟的轉接速度（如果模型存在外接硬碟可能很慢）
+
+### Q: 「Gatekeeper 擋住了 App」
+**A**: 首次開啟打包版 App 時，按以下任一方式解除隔離：
+- 方式 1：對 App 圖示按右鍵 → 開啟 → 再次確認開啟
+- 方式 2：系統設定 → 隱私權與安全性 → 允許
+- 方式 3：Terminal 執行 `xattr -dr com.apple.quarantine /Applications/TaiwanSubtitle.app`
+
+### Q: 輸出的 SRT 時間碼不準
+**A**:
+- 這是 Forced Aligner 的限制（無法保證 100% 精準）
+- 檢查 `output.json` 中的 `aligner.error` 欄位
+- 如果顯示「fallback」，表示對齐失敗 ➜ 試執行 `--verbose` 查看詳細日誌：
+  ```bash
+  python transcribe.py input.mp4 --verbose --output-dir output
+  ```
+- 某些方言或口音可能需手動調整時間碼
+
+### Q: GUI 中無法看到警告訊息
+**A**:
+- 警告會記錄在 `output.json` 的 `warnings` 欄位
+- 目前 GUI 結果視窗不顯示詳細警告（計畫 2026 Q3 改進）
+- 轉錄失敗時，查看 Terminal 或 GUI 的日誌輸出
+
+### Q: 「找不到 FFmpeg」
+**A**: FFmpeg 是系統工具，需透過 Homebrew 安裝：
+```bash
+# 確認是否安裝
+which ffmpeg
+brew install ffmpeg
+
+# 確認版本
+ffmpeg -version
+```
+
+### Q: 能在 Intel Mac 上跑嗎？
+**A**: **不正式支援**。
+- 理論上 MLX 可用 Rosetta 2 相容層執行，但效能會大幅下降（可能慢 10 倍）
+- 預設 ASR 模型（TEA-ASR-MLX-4bit）針對 Apple Silicon 最佳化
+- 如需在 Intel Mac 上使用，請考慮改用原始 PyTorch 版本的 TEA-ASR
+
+### Q: 怎樣報告 Bug？
+**A**: 請在 GitHub 上開 Issue，包含：
+1. Mac 型號與 RAM（例如 M1 Pro / 16GB）
+2. macOS 版本（執行 `sw_vers`）
+3. Python 版本（執行 `python --version`）
+4. 音訊檔的格式和長度
+5. **`output.json` 中的診斷欄位**（若有產出的話）：
+   ```json
+   {
+     "asr_model_used": "...",
+     "asr_fallback_reason": "...",
+     "warnings": [...]
+   }
+   ```
+6. 完整的錯誤訊息（如有）
+
+---
 
 ## 模型與套件來源
 
