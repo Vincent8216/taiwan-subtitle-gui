@@ -20,7 +20,7 @@ if [ ! -x "$VENV_PYINSTALLER" ]; then
 fi
 
 APP_NAME="TaiwanSubtitle"
-VERSION="0.1.0"
+VERSION="0.2.0"
 DIST_DIR="dist"
 WORK_DIR="build"
 DMG_PATH="$DIST_DIR/${APP_NAME}-${VERSION}.dmg"
